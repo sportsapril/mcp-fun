@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "tripadvisor": {
+      "command": "tripadvisor-mcp"
+    },
+    "twitter-invoice": {
+      "command": "twitter-invoice"
+    },
+    "gmail": {
+      "command": "gmail-mcp"
+    },
+    "dataset-analysis": {
+      "command": "dataset-analysis"
+    }
+  }
+}
