@@ -90,9 +90,9 @@ CITY_NAME_ALIASES = {
 
 def load_location_database():
     """
-    Load location-to-geo-ID mappings from CSV files.
+    Load location-to-geo-ID mappings from CSV file.
 
-    Loads data/tripadvisor_geo_map/usa.csv and world.csv into memory.
+    Loads data/tripadvisor_geo_map/locations.csv into memory.
     Structure: {location_name_lower: [{"locationId": "...", "url": "..."}, ...]}
 
     Multiple entries per location are supported (e.g., Washington in different states).
@@ -103,52 +103,46 @@ def load_location_database():
         # Already loaded
         return
 
-    # Find CSV files relative to this module
+    # Find CSV file relative to this module
     module_dir = Path(__file__).parent
     project_root = module_dir.parent.parent
-    csv_dir = project_root / "data" / "tripadvisor_geo_map"
+    csv_path = project_root / "data" / "tripadvisor_geo_map" / "locations.csv"
 
-    csv_files = ["usa.csv", "world.csv"]
+    if not csv_path.exists():
+        logger.error(f"CSV file not found: {csv_path}")
+        return
+
     total_loaded = 0
 
-    for csv_file in csv_files:
-        csv_path = csv_dir / csv_file
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                location = row.get("location", "").strip()
+                location_id = row.get("locationId", "").strip()
+                url = row.get("url", "").strip()
 
-        if not csv_path.exists():
-            logger.warning(f"CSV file not found: {csv_path}")
-            continue
+                if not location or not location_id:
+                    continue
 
-        try:
-            with open(csv_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    location = row.get("location", "").strip()
-                    location_id = row.get("locationId", "").strip()
-                    url = row.get("url", "").strip()
+                # Normalize location name (lowercase for matching)
+                location_lower = location.lower()
 
-                    if not location or not location_id:
-                        continue
+                # Store as list since some locations have multiple entries
+                if location_lower not in _location_database:
+                    _location_database[location_lower] = []
 
-                    # Normalize location name (lowercase for matching)
-                    location_lower = location.lower()
+                _location_database[location_lower].append({
+                    "location": location,  # Keep original for display
+                    "locationId": location_id,
+                    "url": url,
+                })
+                total_loaded += 1
 
-                    # Store as list since some locations have multiple entries
-                    if location_lower not in _location_database:
-                        _location_database[location_lower] = []
+        logger.info(f"Location database loaded: {len(_location_database)} unique locations, {total_loaded} total entries")
 
-                    _location_database[location_lower].append({
-                        "location": location,  # Keep original for display
-                        "locationId": location_id,
-                        "url": url,
-                    })
-                    total_loaded += 1
-
-            logger.info(f"Loaded {csv_path.name}: {len(_location_database)} unique locations")
-
-        except Exception as e:
-            logger.error(f"Error loading {csv_path}: {e}")
-
-    logger.info(f"Location database loaded: {len(_location_database)} locations, {total_loaded} total entries")
+    except Exception as e:
+        logger.error(f"Error loading {csv_path}: {e}")
 
 
 def get_http_client() -> httpx.AsyncClient:
@@ -391,7 +385,7 @@ async def find_tripadvisor_tourism_links(
 
 def save_city_to_csv(city: str, location_id: str, url: str) -> None:
     """
-    Save a new city to the world.csv file.
+    Save a new city to the locations.csv file.
 
     Args:
         city: City name (lowercase for English, original for Chinese)
@@ -400,7 +394,7 @@ def save_city_to_csv(city: str, location_id: str, url: str) -> None:
     """
     module_dir = Path(__file__).parent
     project_root = module_dir.parent.parent
-    csv_path = project_root / "data" / "tripadvisor_geo_map" / "world.csv"
+    csv_path = project_root / "data" / "tripadvisor_geo_map" / "locations.csv"
 
     if not csv_path.exists():
         logger.error(f"CSV file not found: {csv_path}")
@@ -415,7 +409,7 @@ def save_city_to_csv(city: str, location_id: str, url: str) -> None:
             # Check if this city already exists
             for row in rows:
                 if row.get("location", "").lower() == city.lower() and row.get("locationId") == location_id:
-                    logger.info(f"City '{city}' (g{location_id}) already exists in world.csv")
+                    logger.info(f"City '{city}' (g{location_id}) already exists in locations.csv")
                     return
 
             next_row = len(rows) + 1
@@ -424,7 +418,7 @@ def save_city_to_csv(city: str, location_id: str, url: str) -> None:
         with open(csv_path, "a", encoding="utf-8", newline="") as f:
             f.write(f"{next_row},{city},{location_id},{url}\n")
 
-        logger.info(f"✅ Saved '{city}' (g{location_id}) to world.csv")
+        logger.info(f"✅ Saved '{city}' (g{location_id}) to locations.csv")
 
         # Also update in-memory database
         if city.lower() not in _location_database:
@@ -444,7 +438,7 @@ async def lookup_geo_id_dynamic(city: str) -> Optional[str]:
     Dynamically look up geo ID using Playwright browser automation.
 
     Uses Playwright to search TripAdvisor, find Tourism links, and extract geo IDs.
-    If found, automatically saves the city to world.csv for future use.
+    If found, automatically saves the city to locations.csv for future use.
 
     Args:
         city: City name in Chinese or English (e.g., "德州", "Dezhou")
