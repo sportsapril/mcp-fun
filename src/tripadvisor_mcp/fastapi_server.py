@@ -6,15 +6,18 @@ to enable integration with Supabase Edge Functions and other HTTP clients.
 """
 
 import asyncio
+import csv
 import logging
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Import the search function from the MCP server
-from .server import search_tripadvisor
+# Import the search function and constants from the MCP server
+from .server import search_tripadvisor, BASE_URL
+# import tripadvisor_mcp.server as ta_server: AX: this is the original one
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +59,7 @@ class EntitySearchRequest(BaseModel):
             {"name": "Sushi Dai", "type": "restaurant", "city": "Tokyo"}
         ]
     )
-    max_results_per_entity: int = Field(default=3, ge=1, le=10)
+    max_results_per_entity: int = Field(default=5, ge=1, le=10)
 
 
 class SearchResponse(BaseModel):
@@ -166,13 +169,16 @@ async def batch_search(request: EntitySearchRequest):
             entity_type = entity.get("type", "attraction")
             city = entity.get("city", "")
 
-            # Construct query based on type
+            # Construct query by including entity name + type
+            # This gives much better search results than just searching by type
             if entity_type == "restaurant":
-                query = "restaurants"
+                query = f"{entity_name} restaurant"
             elif entity_type == "hotel":
-                query = "hotels"
+                query = f"{entity_name} hotel"
             else:
-                query = "attractions"
+                query = f"{entity_name} attraction"
+
+            logger.info(f"Searching for: query='{query}', location='{city}'")
 
             # Create search task
             task = search_tripadvisor(
@@ -184,6 +190,7 @@ async def batch_search(request: EntitySearchRequest):
 
         # Execute all searches in parallel
         results = []
+
         for entity_name, entity_type, city, task in tasks:
             try:
                 search_result = await task
@@ -191,22 +198,9 @@ async def batch_search(request: EntitySearchRequest):
                 # Filter results to find best match for entity name
                 filtered_results = []
                 if search_result.get("success") and search_result.get("results"):
-                    for result in search_result["results"]:
-                        # Simple name matching (case-insensitive, partial match)
-                        result_title = result.get("title", "").lower()
-                        entity_name_lower = entity_name.lower()
+                    filtered_results = search_result["results"][:request.max_results_per_entity]
 
-                        # Check if entity name appears in result title
-                        if (entity_name_lower in result_title or
-                            result_title in entity_name_lower or
-                            # For Chinese names, just return all results
-                            any('\u4e00' <= char <= '\u9fff' for char in entity_name)):
-                            filtered_results.append(result)
-
-                    # If no exact matches, return top results anyway
-                    if not filtered_results:
-                        filtered_results = search_result["results"][:request.max_results_per_entity]
-
+                # Add result to list
                 results.append({
                     "entity": entity_name,
                     "type": entity_type,
@@ -230,6 +224,123 @@ async def batch_search(request: EntitySearchRequest):
 
     except Exception as e:
         logger.error(f"Error during batch search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/location-ids")
+async def get_location_ids() -> Dict[str, str]:
+    """
+    Load TripAdvisor location IDs from CSV file.
+    Returns a mapping of location names to their g-numbers.
+
+    Example response:
+    {
+        "Chengdu": "g297463",
+        "Beijing": "g294212",
+        "成都": "g297463",
+        ...
+    }
+    """
+    try:
+        # Path to CSV file
+        csv_path = Path(__file__).parent.parent.parent / "data" / "tripadvisor_geo_map" / "locations.csv"
+
+        if not csv_path.exists():
+            logger.error(f"Location CSV not found at: {csv_path}")
+            raise HTTPException(status_code=500, detail="Location data file not found")
+
+        location_map: Dict[str, str] = {}
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                location_name = row['location']
+                location_id = row['locationId']
+
+                # Store with g-prefix
+                g_id = f"g{location_id}"
+                location_map[location_name] = g_id
+
+        logger.info(f"Loaded {len(location_map)} location IDs from CSV")
+        return location_map
+
+    except Exception as e:
+        logger.error(f"Error loading location IDs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/chinese-to-english-cities")
+async def get_chinese_to_english_cities() -> Dict[str, str]:
+    """
+    Load Chinese to English city name mapping from CSV file.
+    Returns a mapping of Chinese city names to English city names.
+    Data source: /data/chinese_cities_translated.csv
+    """
+    try:
+        csv_path = Path(__file__).parent.parent.parent / "data" / "chinese_cities_translated.csv"
+
+        if not csv_path.exists():
+            logger.error(f"Chinese cities CSV not found at: {csv_path}")
+            raise HTTPException(status_code=500, detail="Chinese cities data file not found")
+
+        city_map: Dict[str, str] = {}
+
+        with open(csv_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig handles BOM
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Skip rows that don't have the required columns
+                if 'city_chinese' not in row or 'city' not in row:
+                    continue
+                if not row['city_chinese'] or not row['city']:
+                    continue
+
+                chinese_name = row['city_chinese']
+                english_name = row['city']
+                # Map Chinese name to English name
+                city_map[chinese_name] = english_name
+
+        logger.info(f"Loaded {len(city_map)} Chinese-to-English city mappings from CSV")
+        return city_map
+
+    except Exception as e:
+        logger.error(f"Error loading Chinese city mappings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class LogEntry(BaseModel):
+    """Log entry for TripAdvisor search activity"""
+    timestamp: str
+    event_type: str  # REQUEST, RESPONSE, VALIDATION, DECISION
+    message: str
+
+
+@app.post("/log-tripadvisor-activity")
+async def log_tripadvisor_activity(entry: LogEntry) -> Dict[str, str]:
+    """
+    Append a log entry to the TripAdvisor search activity log file.
+
+    Log file location preference:
+    1. /Users/aprilxu/Documents/GitHub/ai-lu-xing-jie-jie/tripadvisor-search.log
+    2. Fallback: /Users/aprilxu/Documents/GitHub/mcp-fun/tripadvisor-search.log
+    """
+    try:
+        # Try primary location first
+        primary_log_path = Path("/Users/aprilxu/Documents/GitHub/ai-lu-xing-jie-jie/tripadvisor-search.log")
+        fallback_log_path = Path(__file__).parent.parent.parent / "tripadvisor-search.log"
+
+        log_path = primary_log_path if primary_log_path.parent.exists() else fallback_log_path
+
+        # Format log entry
+        log_line = f"[{entry.timestamp}] [{entry.event_type}] {entry.message}\n"
+
+        # Append to log file
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(log_line)
+
+        return {"status": "success", "log_path": str(log_path)}
+
+    except Exception as e:
+        logger.error(f"Error writing to log file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

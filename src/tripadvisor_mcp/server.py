@@ -33,6 +33,9 @@ logger = logging.getLogger("tripadvisor-mcp")
 app = Server("tripadvisor-mcp")
 
 # Constants
+# Base URL for TripAdvisor
+# Note: Only www.tripadvisor.cn works - other domains (cn.tripadvisor.com,
+# www.tripadvisor.com) are blocked by DataDome bot protection (403 Forbidden)
 BASE_URL = "https://www.tripadvisor.cn"
 SEARCH_URL = f"{BASE_URL}/Search"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
@@ -152,11 +155,16 @@ def get_http_client() -> httpx.AsyncClient:
         http_client = httpx.AsyncClient(
             headers={
                 "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Accept-Encoding": "gzip, deflate, br",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0",
             },
             timeout=30.0,
             follow_redirects=True,
@@ -539,8 +547,6 @@ LOCATION_GEO_IDS = {
     "changsha": "g494933",
     "桂林": "g298556",
     "guilin": "g298556",
-    "三亚": "g303719",
-    "sanya": "g303719",
     "丽江": "g303718",
     "lijiang": "g303718",
     "张家界": "g297459",
@@ -556,13 +562,21 @@ LOCATION_GEO_IDS = {
 }
 
 
-async def determine_category_and_url(query: str, location: Optional[str] = None) -> tuple[str, str, str, bool]:
+async def determine_category_and_url(query: str, location: Optional[str] = None, base_url: str = None) -> tuple[str, str, str, bool]:
     """
     Determine the category and build the appropriate URL.
+
+    Args:
+        query: Search query
+        location: Location to search in
+        base_url: TripAdvisor base URL to use (defaults to global BASE_URL)
 
     Returns:
         (category, url, geo_id, location_known)
     """
+    # Use provided base_url or fall back to global BASE_URL
+    if base_url is None:
+        base_url = BASE_URL
     query_lower = query.lower()
 
     # Determine geo ID using four-tier lookup system:
@@ -610,48 +624,152 @@ async def determine_category_and_url(query: str, location: Optional[str] = None)
 
         location_known = geo_id is not None
 
-    # Determine category and build URL
+    # Determine category and build URL (using the provided base_url)
     if "hotel" in query_lower or "酒店" in query_lower:
         category = "hotels"
         if geo_id:
-            url = f"{BASE_URL}/Hotels-{geo_id}-{location}-Hotels.html"
+            url = f"{base_url}/Hotels-{geo_id}-{location}-Hotels.html"
         else:
-            url = f"{BASE_URL}/Hotels"
+            url = f"{base_url}/Hotels"
 
     elif "restaurant" in query_lower or "餐厅" in query_lower or "美食" in query_lower:
         category = "restaurants"
         if geo_id:
-            url = f"{BASE_URL}/Restaurants-{geo_id}-{location}.html"
+            url = f"{base_url}/Restaurants-{geo_id}-{location}.html"
         else:
-            url = f"{BASE_URL}/Restaurants"
+            url = f"{base_url}/Restaurants"
 
     elif "attraction" in query_lower or "景点" in query_lower or "things to do" in query_lower or "活动" in query_lower:
         category = "attractions"
         if geo_id:
-            url = f"{BASE_URL}/Attractions-{geo_id}-Activities-{location}.html"
+            url = f"{base_url}/Attractions-{geo_id}-Activities-{location}.html"
         else:
-            url = f"{BASE_URL}/Attractions"
+            url = f"{base_url}/Attractions"
 
     else:
         # Default to attractions for general queries
         category = "attractions"
         if geo_id:
-            url = f"{BASE_URL}/Attractions-{geo_id}-Activities-{location}.html"
+            url = f"{base_url}/Attractions-{geo_id}-Activities-{location}.html"
         else:
-            url = f"{BASE_URL}/Tourism"
+            url = f"{base_url}/Tourism"
 
     return category, url, geo_id or "unknown", location_known
 
 
-async def search_tripadvisor(
+async def search_with_api(entity_name: str, location_id: str, category: str, max_results: int = 3) -> list[dict]:
+    """
+    Use TripAdvisor's globalSearch API to search for entities not in static HTML.
+    This is much faster and more reliable than Playwright.
+    """
+    import urllib.parse
+
+    # TripAdvisor's globalSearch API endpoint
+    api_url = "https://api.tripadvisor.cn/restapi/soa2/21221/globalSearch"
+
+    logger.info(f"Using globalSearch API for: '{entity_name}' in location {location_id}")
+
+    try:
+        # Prepare request payload (matching the actual API used by TripAdvisor website)
+        payload = {
+            "keywords": entity_name,
+            "pageNo": 1,
+            "pageSize": max_results * 2,  # Get more to ensure we have good matches
+            "lat": "",  # Can be empty
+            "lon": "",  # Can be empty
+        }
+
+        # Make API request
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                api_url,
+                json=payload,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Content-Type": "application/json",
+                },
+                timeout=10.0,
+            )
+
+            if response.status_code != 200:
+                logger.error(f"API returned status {response.status_code}")
+                return []
+
+            data = response.json()
+
+            # Log response for debugging
+            logger.info(f"API response code: {data.get('code')}")
+
+            # Check API response (code 200 means success)
+            if data.get("code") != 200:
+                logger.error(f"API error (code={data.get('code')}): {data.get('message', 'Unknown')}")
+                return []
+
+            # Extract results
+            result = data.get("result", {})
+            hits = result.get("hits", [])
+
+            logger.info(f"API returned {len(hits)} hits")
+
+            results = []
+            for hit in hits[:max_results]:
+                try:
+                    name = hit.get("name", "")
+                    page_url = hit.get("pageUrl", "")
+                    rating = hit.get("rating", "N/A")
+                    review_count = hit.get("totalComments", 0)
+                    data_type = hit.get("dataType", "")
+
+                    # Skip if no URL
+                    if not page_url:
+                        continue
+
+                    # Map dataType to category
+                    result_category = category
+                    if data_type == "SIGHT":
+                        result_category = "attraction"
+                    elif data_type == "HOTEL":
+                        result_category = "hotel"
+                    elif data_type == "RESTAURANT":
+                        result_category = "restaurant"
+
+                    # Format rating
+                    if rating and rating != "N/A":
+                        rating_str = f"{rating}/5.0"
+                    else:
+                        rating_str = "N/A"
+
+                    results.append({
+                        "title": name,
+                        "url": page_url,
+                        "category": result_category.capitalize(),
+                        "rating": rating_str,
+                        "reviews": f"{review_count} reviews" if review_count > 0 else "0 reviews",
+                    })
+
+                    logger.info(f"Found via API: {name} ({review_count} reviews)")
+
+                except Exception as e:
+                    logger.error(f"Error parsing hit: {e}")
+                    continue
+
+            return results
+
+    except Exception as e:
+        logger.error(f"API search failed: {e}")
+        return []
+
+
+async def search_tripadvisor_single_url(
     query: str,
     location: Optional[str] = None,
     date: Optional[str] = None,
     price_range: Optional[str] = None,
     max_results: int = 10,
+    base_url: str = None,
 ) -> dict[str, Any]:
     """
-    Search TripAdvisor China for travel information.
+    Search a single TripAdvisor URL for travel information.
 
     Args:
         query: Search query (e.g., "hotel", "restaurant", "things to do")
@@ -659,15 +777,35 @@ async def search_tripadvisor(
         date: Date in YYYY-MM-DD format (if applicable)
         price_range: Price range filter (e.g., "budget", "mid-range", "luxury")
         max_results: Maximum number of results to return
+        base_url: TripAdvisor base URL to use (e.g., "https://www.tripadvisor.cn")
 
     Returns:
         Dictionary with search results including titles, descriptions, images, URLs, and ratings
     """
+    # Use provided base_url or fall back to global BASE_URL
+    if base_url is None:
+        base_url = BASE_URL
     try:
         client = get_http_client()
 
-        # Determine category and build URL
-        category, search_url, geo_id, location_known = await determine_category_and_url(query, location)
+        # Check if query contains a specific entity name (not just a category)
+        query_lower = query.lower()
+        category_keywords = ["hotel", "酒店", "restaurant", "餐厅", "美食", "attraction", "景点", "things to do", "活动"]
+
+        # Extract entity name by removing category keywords
+        entity_name = query
+        for keyword in category_keywords:
+            entity_name = entity_name.replace(keyword, "").strip()
+
+        # Store entity name for later filtering
+        has_entity_name = len(entity_name) > 0
+
+        # Determine category and build URL (always use category pages, not Search API)
+        # Pass the base_url parameter so the correct TripAdvisor domain is used
+        category, search_url, geo_id, location_known = await determine_category_and_url(query, location, base_url)
+
+        if has_entity_name:
+            logger.info(f"Will filter results for entity: '{entity_name}'")
 
         # Warn if location is unknown (both hardcoded and dynamic lookup failed)
         if location and not location_known:
@@ -678,13 +816,31 @@ async def search_tripadvisor(
                 "query": query,
                 "location": location,
                 "category": category,
-                "suggestion": f"Visit {BASE_URL} directly to search for {location}.",
+                "suggestion": f"Visit {base_url} directly to search for {location}.",
             }
 
         logger.info(f"Searching TripAdvisor: {search_url} (category: {category}, geo: {geo_id})")
 
-        # Make request
-        response = await client.get(search_url)
+        # Make request with additional headers for the specific domain
+        headers = {}
+        if "cn.tripadvisor.com" in base_url:
+            # Add Referer for cn.tripadvisor.com to appear more browser-like
+            headers["Referer"] = f"{base_url}/"
+        
+        response = await client.get(search_url, headers=headers)
+        
+        # Handle 403 Forbidden gracefully (some domains block automated requests)
+        if response.status_code == 403:
+            logger.warning(f"403 Forbidden from {base_url} - domain may be blocking automated requests")
+            return {
+                "success": False,
+                "error": f"Access denied (403) from {base_url}. This domain may block automated requests.",
+                "query": query,
+                "location": location,
+                "category": category,
+                "suggestion": f"Try using {BASE_URLS[0]} instead, or visit {search_url} directly in a browser.",
+            }
+        
         response.raise_for_status()
 
         # Parse HTML to extract Next.js data
@@ -725,11 +881,11 @@ async def search_tripadvisor(
                         # Use the url field from restaurant data if available (it's the correct full URL)
                         restaurant_url = restaurant.get('url', '')
                         if restaurant_url and not restaurant_url.startswith('http'):
-                            restaurant_url = f"{BASE_URL}/{restaurant_url}"
+                            restaurant_url = f"{base_url}/{restaurant_url}"
                         elif not restaurant_url:
                             # Fallback to constructing URL (though this may not work)
                             restaurant_geo_id = restaurant.get('geoId') or geo_id.replace('g', '')
-                            restaurant_url = f"{BASE_URL}/Restaurant_Review-g{restaurant_geo_id}-d{restaurant.get('restaurantId', '')}.html"
+                            restaurant_url = f"{base_url}/Restaurant_Review-g{restaurant_geo_id}-d{restaurant.get('restaurantId', '')}.html"
 
                         result = {
                             "title": restaurant.get("name", ""),
@@ -773,16 +929,27 @@ async def search_tripadvisor(
         elif category == "attractions":
             # Attractions are in verticalData
             vertical_data = initial_state.get("verticalData", [])
+            
+            logger.info(f"Found {len(vertical_data)} attractions in verticalData (TripAdvisor initial page load)")
 
-            for attraction in vertical_data[:max_results]:
+            # Get more results if we're filtering by entity name (so we have more to match against)
+            # fetch_limit = max_results * 3 if has_entity_name else max_results # AX changed
+            fetch_limit = (
+                min(len(vertical_data), max_results * 10)
+                if has_entity_name
+                else min(len(vertical_data), max_results)
+            )
+            logger.info(f"Fetch limit: {fetch_limit} (max_results={max_results}, has_entity_name={has_entity_name})")
+
+            for attraction in vertical_data[:fetch_limit]:
                 # Use the url field from attraction data if available (like restaurants)
                 attraction_url = attraction.get('url', '')
                 if attraction_url and not attraction_url.startswith('http'):
-                    attraction_url = f"{BASE_URL}/{attraction_url}"
+                    attraction_url = f"{base_url}/{attraction_url}"
                 elif not attraction_url:
                     # Fallback to constructing URL
                     geo_id_num = geo_id.replace('g', '') if geo_id.startswith('g') else geo_id
-                    attraction_url = f"{BASE_URL}/Attraction_Review-g{geo_id_num}-d{attraction.get('taSightId', '')}.html"
+                    attraction_url = f"{base_url}/Attraction_Review-g{geo_id_num}-d{attraction.get('taSightId', '')}.html"
 
                 result = {
                     "title": attraction.get("displayName", ""),
@@ -835,7 +1002,7 @@ async def search_tripadvisor(
                 for hotel in hotel_data[:max_results]:
                     result = {
                         "title": hotel.get("name", ""),
-                        "url": f"{BASE_URL}/Hotel_Review-g{hotel.get('geoId', '')}-d{hotel.get('hotelId', '')}.html",
+                        "url": f"{base_url}/Hotel_Review-g{hotel.get('geoId', '')}-d{hotel.get('hotelId', '')}.html",
                         "rating": hotel.get("rating", ""),
                         "reviews": f"{hotel.get('reviewCount', 0)} reviews",
                         "category": "Hotel",
@@ -869,6 +1036,59 @@ async def search_tripadvisor(
 
         logger.info(f"Extracted {len(results)} results")
 
+        # If we have an entity name, filter/sort results by name matching
+        if has_entity_name and results:
+            logger.info(f"Filtering results for entity name: '{entity_name}'")
+
+            # Score each result based on how well it matches the entity name
+            scored_results = []
+            entity_name_lower = entity_name.lower()
+
+            for result in results:
+                title = result.get("title", "").lower()
+                score = 0
+
+                # Exact match
+                if entity_name_lower == title:
+                    score = 100
+                # Entity name is contained in title
+                elif entity_name_lower in title:
+                    score = 80
+                # Title is contained in entity name
+                elif title in entity_name_lower:
+                    score = 70
+                # Check for partial character matches (for Chinese names)
+                else:
+                    # Count how many characters from entity_name appear in title
+                    matching_chars = sum(1 for char in entity_name_lower if char in title)
+                    score = (matching_chars / len(entity_name_lower)) * 50 if len(entity_name_lower) > 0 else 0
+
+                scored_results.append((score, result))
+                logger.info(f"  - '{result.get('title', '')}': score={score:.1f}")
+
+            # Sort by score (highest first)
+            scored_results.sort(key=lambda x: x[0], reverse=True)
+
+            # Take results with score > 0 only
+            filtered_results = [r for s, r in scored_results if s > 0]
+            if not filtered_results:
+                # No good matches found in static HTML
+                # Try using globalSearch API
+                logger.warning(f"No good matches found for '{entity_name}' in static HTML. Trying globalSearch API...")
+
+                location_id = geo_id.replace('g', '') if geo_id.startswith('g') else geo_id
+                api_results = await search_with_api(entity_name, location_id, category, max_results)
+
+                if api_results:
+                    logger.info(f"Found {len(api_results)} results via API")
+                    results = api_results
+                else:
+                    logger.warning(f"API search also found no results for '{entity_name}'")
+                    results = []
+            else:
+                logger.info(f"Filtered to {len(filtered_results)} matching results")
+                results = filtered_results[:max_results]
+
         return {
             "success": True,
             "query": query,
@@ -894,6 +1114,42 @@ async def search_tripadvisor(
             "error": str(e),
             "query": query,
         }
+
+
+async def search_tripadvisor(
+    query: str,
+    location: Optional[str] = None,
+    date: Optional[str] = None,
+    price_range: Optional[str] = None,
+    max_results: int = 10,
+    base_url: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Search TripAdvisor for travel information.
+
+    This is a convenience wrapper around search_tripadvisor_single_url.
+
+    Args:
+        query: Search query (e.g., "hotel", "restaurant", "things to do")
+        location: Location to search in (e.g., "上海", "北京")
+        date: Date in YYYY-MM-DD format (if applicable)
+        price_range: Price range filter (e.g., "budget", "mid-range", "luxury")
+        max_results: Maximum number of results to return
+        base_url: TripAdvisor base URL to use (defaults to global BASE_URL)
+
+    Returns:
+        Dictionary with search results
+    """
+    if base_url is None:
+        base_url = BASE_URL
+    return await search_tripadvisor_single_url(
+        query=query,
+        location=location,
+        date=date,
+        price_range=price_range,
+        max_results=max_results,
+        base_url=base_url,
+    )
 
 
 def format_results_for_display(search_data: dict[str, Any]) -> list[TextContent | ImageContent]:
