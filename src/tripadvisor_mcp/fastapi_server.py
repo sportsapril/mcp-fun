@@ -8,11 +8,13 @@ to enable integration with Supabase Edge Functions and other HTTP clients.
 import asyncio
 import csv
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional, Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 # Import the search function and constants from the MCP server
@@ -22,6 +24,13 @@ from .server import search_tripadvisor, BASE_URL
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tripadvisor-fastapi")
+
+# Get optional API key from environment
+FASTAPI_API_KEY = os.getenv("FASTAPI_API_KEY")
+if FASTAPI_API_KEY:
+    logger.info("API key authentication enabled")
+else:
+    logger.warning("API key authentication disabled - set FASTAPI_API_KEY to enable")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -38,6 +47,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# API Key security scheme (optional)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(x_api_key: str = Security(api_key_header)) -> bool:
+    """
+    Verify API key if FASTAPI_API_KEY is set.
+    If not set, allow all requests (for local development).
+    """
+    if not FASTAPI_API_KEY:
+        # No API key configured - allow request
+        return True
+
+    if not x_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Provide X-API-Key header."
+        )
+
+    if x_api_key != FASTAPI_API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid API key"
+        )
+
+    return True
 
 
 # Request/Response Models
@@ -103,7 +138,7 @@ async def health():
 
 
 @app.post("/search", response_model=SearchResponse)
-async def search(request: SearchRequest):
+async def search(request: SearchRequest, authorized: bool = Security(verify_api_key)):
     """
     Search TripAdvisor for a single query
 
@@ -132,7 +167,7 @@ async def search(request: SearchRequest):
 
 
 @app.post("/search/batch")
-async def batch_search(request: EntitySearchRequest):
+async def batch_search(request: EntitySearchRequest, authorized: bool = Security(verify_api_key)):
     """
     Batch search for multiple entities
 
@@ -228,7 +263,7 @@ async def batch_search(request: EntitySearchRequest):
 
 
 @app.get("/location-ids")
-async def get_location_ids() -> Dict[str, str]:
+async def get_location_ids(authorized: bool = Security(verify_api_key)) -> Dict[str, str]:
     """
     Load TripAdvisor location IDs from CSV file.
     Returns a mapping of location names to their g-numbers.
@@ -270,7 +305,7 @@ async def get_location_ids() -> Dict[str, str]:
 
 
 @app.get("/chinese-to-english-cities")
-async def get_chinese_to_english_cities() -> Dict[str, str]:
+async def get_chinese_to_english_cities(authorized: bool = Security(verify_api_key)) -> Dict[str, str]:
     """
     Load Chinese to English city name mapping from CSV file.
     Returns a mapping of Chinese city names to English city names.
@@ -315,7 +350,7 @@ class LogEntry(BaseModel):
 
 
 @app.post("/log-tripadvisor-activity")
-async def log_tripadvisor_activity(entry: LogEntry) -> Dict[str, str]:
+async def log_tripadvisor_activity(entry: LogEntry, authorized: bool = Security(verify_api_key)) -> Dict[str, str]:
     """
     Append a log entry to the TripAdvisor search activity log file.
 

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: tripadvisor-fastapi
+    env: python
+    region: oregon
+    plan: free
+    branch: main
+    buildCommand: "pip install -r requirements-fastapi.txt && playwright install chromium"
+    startCommand: "bash start.sh"
+    envVars:
+      - key: FASTAPI_API_KEY
+        generateValue: true
+        # You can set this manually in Render dashboard
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: PYTHONPATH
+        value: "/opt/render/project/src:$PYTHONPATH"
