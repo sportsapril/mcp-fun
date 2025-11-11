@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python312", "playwright-driver-chromium"]
+
+[phases.install]
+cmds = ["pip install -r requirements-fastapi.txt", "playwright install chromium"]
+
+[start]
+cmd = "uvicorn tripadvisor_mcp.fastapi_server:app --host 0.0.0.0 --port $PORT"
