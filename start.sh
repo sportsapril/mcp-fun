@@ -1,7 +1,6 @@
 #!/bin/bash
-# Change to src directory and add it to PYTHONPATH
-cd /opt/render/project/src
+# Set PYTHONPATH to include src directory
 export PYTHONPATH="/opt/render/project/src:${PYTHONPATH}"
 
-# Start uvicorn from the src directory
+# Start uvicorn (it will find the module via PYTHONPATH)
 exec uvicorn tripadvisor_mcp.fastapi_server:app --host 0.0.0.0 --port $PORT

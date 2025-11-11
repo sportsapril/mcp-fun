@@ -5,7 +5,7 @@ services:
     region: oregon
     plan: free
     branch: main
-    buildCommand: "pip install -r requirements-fastapi.txt && playwright install chromium"
+    buildCommand: "pip install -r requirements-fastapi.txt && pip install -e . && playwright install chromium"
     startCommand: "bash start.sh"
     envVars:
       - key: FASTAPI_API_KEY
